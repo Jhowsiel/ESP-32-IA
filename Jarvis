@@ -3,14 +3,26 @@ import threading
 import time
 import random
 import sys
+import math
+import io
+import os
 
+# GUI
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+# Pillow (opcional, recomendado para JPEG). Se não tiver, usaremos PhotoImage com PNG.
+try:
+    from PIL import Image, ImageTk  # pip install pillow
+    PIL_AVAILABLE = True
+except Exception:
+    PIL_AVAILABLE = False
+
+# pyserial (obrigatório para comunicação com ESP32)
 try:
     import serial
     import serial.tools.list_ports
 except ImportError:
-    import tkinter as tk
-    from tkinter import messagebox
-
     root = tk.Tk()
     root.withdraw()
     messagebox.showerror(
@@ -21,16 +33,16 @@ except ImportError:
     )
     sys.exit(1)
 
-import tkinter as tk
-from tkinter import ttk, messagebox
+# Somente imagem local (sem URL)
+# Coloque o arquivo do QR ao lado do script, por exemplo: qr.png (PNG recomendado)
+QR_LOCAL_FILE = "qr.png"  # se for JPEG, use Pillow; com PhotoImage só PNG/GIF
 
-# parâmetros gerais
-BOT_TURN_TIMEOUT = 3.0          # janela para agrupar linhas da IA
-SLEEP_TIMEOUT = 20.0            # tempo parado até marcar como desconectada
-SIDE_CYCLE_INTERVAL = 100_000   # troca automática de aba (Projeto/Equipe/QR)
+# Parâmetros gerais
+BOT_TURN_TIMEOUT = 3.0
+SLEEP_TIMEOUT = 20.0
+SIDE_CYCLE_INTERVAL = 100_000
 
-
-# -------------------- parse de linha do ESP --------------------
+# -------------------- Parse de linha do ESP --------------------
 
 regex_info = re.compile(r"^I\s*\((\d+)\)\s+(.+?):\s*(.*)")
 regex_warn = re.compile(r"^W\s*\((\d+)\)\s+(.+?):\s*(.*)")
@@ -61,1371 +73,179 @@ def parse_line(line: str):
     return {"type": "other", "tag": None, "content": line}
 
 
-# -------------------- rosto da Alicia --------------------
-
-import tkinter as tk
-import time
-import random
-import math
-
-"""
-face_widget_batman.py
-
-Versão temática: "Batman" estilo rosto/mascara.
-Mantém a API usada pelo app:
-  - set_estado(estado)
-  - marcar_fala(segundos, intensity=1.0)
-  - set_mouth_intensity(intensity)
-  - set_mouth_level(level)
-  - clear_mouth_override()
-
-Características:
- - Paleta noturna, capuz/cowl com orelhas pontiagudas
- - Olhos como fissuras brancas que brilham ao falar
- - Emblema de morcego amarelo no peito
- - Pequenas silhuetas de morcegos (partículas) voando ao fundo
- - Mantém animações de olhar, fala, piscar (aqui piscar reduzido para fissuras)
-"""
-import tkinter as tk
-import time
-import random
-import math
+# -------------------- Rosto do Jarvis --------------------
 
 class FaceWidget:
     def __init__(self, parent):
-        self._math = math
-        self._random = random
-
-        # Tela e fundo noturno
-        self.canvas = tk.Canvas(parent, bg="#0b0f1a", highlightthickness=0)
+        self.canvas = tk.Canvas(parent, bg="#010204", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
-        # estado e animações
         self.estado = "sleep"  # idle | listening | speaking | sleep
         self.boca_fase = 0.0
         self.glow_fase = 0.0
 
-        # controle boca
-        self.mouth_intensity = 1.0
-        self.mouth_level_override = None
-        self.fala_ate = 0.0
-
-        # piscada reduzida (fissuras piscam raramente)
         self.piscando = False
         self.ultimo_piscar = time.time()
-        self.intervalo_piscar = 6.0
-        self.intervalo_piscar_sono = 18.0
+        self.intervalo_piscar = 3.2
+        self.intervalo_piscar_sono = 7.5
 
-        # olhar suave (pequeno movimento das fissuras)
-        self.eye_smooth = (0.0, 0.0)
+        self.particulas = []
+        self._init_particulas()
 
-        # "morcegos" (partículas) - pequenas silhuetas voando
-        self.bats = []
-        self._init_bats()
+        self.fala_ate = 0.0
+        self.boca_intensidade = 0.35
 
-        # loop de atualização
-        self.update_interval = 40  # ms (~25 fps)
-        self.canvas.after(self.update_interval, self._loop)
+        self._mouth_override_until = 0.0
+        self._mouth_override_level = None
 
-    def _init_bats(self):
-        self.bats.clear()
-        for _ in range(18):
-            self.bats.append({
-                "x": self._random.random(),
-                "y": self._random.random() * 0.8,
-                "vx": self._random.uniform(-0.002, -0.0004),
-                "vy": self._random.uniform(-0.0002, 0.0002),
-                "size": self._random.uniform(6.0, 14.0),
-                "phase": self._random.random() * 2 * math.pi,
-                "alpha": self._random.uniform(0.4, 1.0)
+        self.canvas.after(60, self._loop)
+
+    def _init_particulas(self):
+        self.particulas.clear()
+        for _ in range(30):
+            self.particulas.append({
+                "x": random.random(),
+                "y": random.random(),
+                "vx": random.uniform(-0.0008, 0.0008),
+                "vy": random.uniform(0.001, 0.004),
+                "r": random.uniform(0.8, 2.2),
+                "alpha": random.uniform(0.4, 1.0),
             })
 
-    # API pública (mantida)
     def set_estado(self, estado: str):
         self.estado = estado
         if estado == "speaking":
             self.boca_fase = 0.0
 
-    def set_mouth_intensity(self, intensity: float):
-        try:
-            v = float(intensity)
-        except Exception:
-            return
-        self.mouth_intensity = max(0.1, min(3.0, v))
-
-    def set_mouth_level(self, level: float):
-        try:
-            v = float(level)
-        except Exception:
-            return
-        self.mouth_level_override = max(0.0, min(1.0, v))
-
-    def clear_mouth_override(self):
-        self.mouth_level_override = None
-
-    def marcar_fala(self, segundos=2.0, intensity=1.0):
+    def marcar_fala(self, segundos=2.0, intensidade=0.35):
         agora = time.time()
         self.fala_ate = max(self.fala_ate, agora + segundos)
-        self.set_mouth_intensity(intensity)
+        self.boca_intensidade = max(0.2, min(0.9, intensidade))
 
-    # loop
+    def set_mouth_level(self, level: float):
+        self._mouth_override_level = max(0.0, float(level))
+        self._mouth_override_until = time.time() + 0.3
+
+    def clear_mouth_override(self):
+        if time.time() >= self._mouth_override_until:
+            self._mouth_override_level = None
+
     def _loop(self):
-        agora = time.time()
         if self.estado == "speaking":
-            # boca oscila mais rápido quando fala
-            self.boca_fase += 2.0 * (0.6 + 0.6 * self.mouth_intensity)
+            self.boca_fase += 0.9
         else:
-            self.boca_fase = max(0.0, self.boca_fase - 0.45)
+            self.boca_fase = max(0.0, self.boca_fase - 0.25)
 
-        self.glow_fase += 0.9
-
-        # piscada automática (rara, fissuras piscam curtamente)
-        intervalo = self.intervalo_piscar_sono if self.estado == "sleep" else self.intervalo_piscar
-        if not self.piscando and (agora - self.ultimo_piscar) > intervalo:
-            self.piscando = True
-            self.ultimo_piscar = agora
-        elif self.piscando and (agora - self.ultimo_piscar) > 0.10:
-            self.piscando = False
-
-        # olhar: pequenas variações das fissuras seguindo o cursor
-        try:
-            px = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
-            py = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
-            w = self.canvas.winfo_width() or 800
-            h = self.canvas.winfo_height() or 450
-            cx = w / 2
-            cy = h / 2.3
-            dx = (px - cx) / max(1.0, w)
-            dy = (py - cy) / max(1.0, h)
-            dx = max(-0.25, min(0.25, dx))
-            dy = max(-0.15, min(0.15, dy))
-            sx, sy = self.eye_smooth
-            sx += (dx - sx) * 0.12
-            sy += (dy - sy) * 0.12
-            self.eye_smooth = (sx, sy)
-        except Exception:
-            self.eye_smooth = (0.0, 0.0)
-
+        self.glow_fase += 0.45
         self._desenhar()
-        self.canvas.after(self.update_interval, self._loop)
+        self.canvas.after(60, self._loop)
 
-    # desenho principal
     def _desenhar(self):
         self.canvas.delete("all")
-        w = self.canvas.winfo_width() or 900
-        h = self.canvas.winfo_height() or 520
-        cx = w / 2
-        cy = h / 2.2
-        size = min(w, h)
+        w = self.canvas.winfo_width() or 800
+        h = self.canvas.winfo_height() or 450
 
         self._desenhar_fundo(w, h)
-        self._desenhar_face(cx, cy, size * 0.46)
+        self._desenhar_visor(w, h)
 
     def _desenhar_fundo(self, w, h):
-        # Gradiente noturno: de preto azul a um azul profundo
-        steps = 12
-        top = (8, 10, 20)
-        bot = (18, 24, 40)
-        for i in range(steps):
-            t = i / max(1, steps - 1)
-            r = int(top[0] + (bot[0] - top[0]) * t)
-            g = int(top[1] + (bot[1] - top[1]) * t)
-            b = int(top[2] + (bot[2] - top[2]) * t)
-            self.canvas.create_rectangle(0, i * (h / steps), w, (i + 1) * (h / steps),
-                                         fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
-
-        # Bats / partículas: pequenas silhuetas voando para a esquerda
-        for b in self.bats:
-            faktor = 0.2 if self.estado == "sleep" else 1.0
-            b["x"] += b["vx"] * faktor
-            b["y"] += b["vy"] * faktor
-            b["phase"] += 0.06 * (0.5 + 0.5 * faktor)
-            if b["x"] < -0.1:
-                b["x"] = 1.2
-                b["y"] = self._random.random() * 0.7
-                b["vx"] = self._random.uniform(-0.002, -0.0005)
-                b["size"] = self._random.uniform(6.0, 14.0)
-            x = b["x"] * w
-            y = b["y"] * h
-            s = b["size"]
-            alpha = b["alpha"] * (0.45 if self.estado == "sleep" else 1.0)
-            # cor deslocada para cinza-claro (sem alpha real)
-            gray = int(200 * alpha)
-            color = f"#{gray:02x}{gray:02x}{gray:02x}"
-            self._draw_bat(x, y, s, color)
-
-        # Silhueta da cidade no horizonte (baixo) - simples e estilizada
-        horizon_y = int(h * 0.82)
-        step_w = max(20, int(w / 40))
-        x = 0
-        while x < w + step_w:
-            b_h = self._random.randint(8, 26)
-            self.canvas.create_rectangle(x, horizon_y - b_h, x + step_w - 2, h, fill="#07101b", outline="")
-            x += step_w
-
-    def _draw_bat(self, x, y, s, color):
-        # Desenho simples em forma de "V" com pequenas asas
-        # Usa polígono para parecer um morcego estilizado
-        wing = s * 0.6
-        body = s * 0.2
-        points = [
-            x - wing, y,
-            x - wing * 0.3, y - body,
-            x, y + body * 0.5,
-            x + wing * 0.3, y - body,
-            x + wing, y,
-            x + wing * 0.2, y + body * 0.6,
-            x - wing * 0.2, y + body * 0.6
-        ]
-        self.canvas.create_polygon(points, fill=color, outline="")
-
-    def _desenhar_face(self, cx, cy, radius):
-        m = self._math
-
-        # --- Cowl / Capuz (máscara) ---
-        head_w = radius * 1.6
-        head_h = radius * 1.5
-        head_top = cy - head_h * 0.15
-
-        # Capuz principal (preto com bordas cinza)
-        cowl_color = "#0b0b0b"
-        cowl_edge = "#202020"
-        self.canvas.create_oval(cx - head_w/2, head_top - head_h/2, cx + head_w/2, head_top + head_h/2,
-                                fill=cowl_color, outline=cowl_edge, width=3)
-
-        # Orelhas pontiagudas
-        ear_h = radius * 0.46
-        ear_w = radius * 0.22
-        # esquerda
-        left_ear = [
-            cx - head_w*0.28, head_top - head_h*0.45,
-            cx - head_w*0.18, head_top - head_h*0.45 - ear_h,
-            cx - head_w*0.08, head_top - head_h*0.45
-        ]
-        # direita
-        right_ear = [
-            cx + head_w*0.28, head_top - head_h*0.45,
-            cx + head_w*0.18, head_top - head_h*0.45 - ear_h,
-            cx + head_w*0.08, head_top - head_h*0.45
-        ]
-        self.canvas.create_polygon(left_ear, fill=cowl_color, outline=cowl_edge)
-        self.canvas.create_polygon(right_ear, fill=cowl_color, outline=cowl_edge)
-
-        # Linha de queixo levemente visível (baixo do cowl)
-        chin_y = cy + head_h*0.35
-        self.canvas.create_oval(cx - head_w*0.42, chin_y - head_h*0.08, cx + head_w*0.42, chin_y + head_h*0.18,
-                                fill="#111216", outline="")
-
-        # --- Olhos (fissuras brancas) ---
-        eye_w = head_w * 0.22
-        eye_h = head_h * 0.12
-        eye_y = cy - head_h * 0.08
-        sep = head_w * 0.26
-        sx, sy = self.eye_smooth
-        left_center = (cx - sep + sx * head_w * 0.03, eye_y + sy * head_h * 0.03)
-        right_center = (cx + sep + sx * head_w * 0.03, eye_y + sy * head_h * 0.03)
-
-        # brilho das fissuras quando falando
-        glow = 0.0
-        if self.estado == "speaking":
-            resto = max(0.0, self.fala_ate - time.time())
-            glow = 0.4 + 0.6 * min(1.0, resto) * self.mouth_intensity
-        elif self.estado == "listening":
-            glow = 0.18
-        elif self.estado == "sleep":
-            glow = 0.06
-        else:
-            glow = 0.12
-
-        self._draw_eye_slit(left_center, eye_w, eye_h, glow)
-        self._draw_eye_slit(right_center, eye_w, eye_h, glow)
-
-        # --- Boca (exposta, pequena) ---
-        mouth_w = head_w * 0.34
-        mouth_base_h = head_h * 0.08
-        mouth_cx = cx
-        mouth_cy = cy + head_h * 0.32
-
-        if self.mouth_level_override is not None:
-            intensity = self.mouth_level_override
-        elif self.estado == "speaking":
-            resto = max(0.0, self.fala_ate - time.time())
-            base = 1.0 if resto > 0 else 0.6
-            intensity = min(1.4, base * self.mouth_intensity)
-        elif self.estado == "listening":
-            intensity = 0.15
-        else:
-            intensity = 0.05
-
-        # desenha a abertura da boca como arco (mais aberto quando fala)
-        open_h = mouth_base_h * (0.4 + 1.2 * intensity) * (0.85 + 0.15 * abs(m.sin(self.boca_fase * 0.6)))
-        open_h = max(open_h, mouth_base_h * 0.2)
-        mouth_color = "#2b2b2b"
-        # boca exposta (pele) - região clara dentro do capuz
-        skin_color = "#efdfc7"  # tom de pele
-        self.canvas.create_oval(mouth_cx - mouth_w/2, mouth_cy - open_h/2, mouth_cx + mouth_w/2, mouth_cy + open_h/2,
-                                fill=skin_color, outline="#c7b299", width=1)
-        # lábio superior (sublinhar)
-        lip_h = open_h * 0.28
-        self.canvas.create_line(mouth_cx - mouth_w/2 * 0.9, mouth_cy - lip_h/2,
-                                mouth_cx + mouth_w/2 * 0.9, mouth_cy - lip_h/2,
-                                fill="#392c22", width=max(1, int(radius*0.02)))
-        # boca interior escura
-        inner_h = open_h * 0.6
-        self.canvas.create_oval(mouth_cx - mouth_w/2 * 0.85, mouth_cy - inner_h/2 + lip_h*0.15,
-                                mouth_cx + mouth_w/2 * 0.85, mouth_cy + inner_h/2 + lip_h*0.15,
-                                fill=mouth_color, outline="")
-
-        # -- Emblema do morcego no peito (amarelo com morcego preto) --
-        emblem_w = head_w * 0.48
-        emblem_h = head_h * 0.28
-        emblem_cx = cx
-        emblem_cy = cy + head_h * 0.7
-        # fundo amarelo (oval)
-        self.canvas.create_oval(emblem_cx - emblem_w/2, emblem_cy - emblem_h/2, emblem_cx + emblem_w/2, emblem_cy + emblem_h/2,
-                                fill="#ffd400", outline="#caa800", width=2)
-        # morcego preto simplificado dentro do oval
-        self._draw_bat_emblem(emblem_cx, emblem_cy, emblem_w * 0.9, emblem_h * 0.7)
-
-        # pequeno texto discreto (estilo bat-sigil)
-        text = "The Night"
-        self.canvas.create_text(cx, emblem_cy + emblem_h*0.9, text=text, fill="#9aa6b2",
-                                font=("Helvetica", max(10, int(radius*0.05))), anchor=tk.N)
-
-    def _draw_eye_slit(self, center, w_eye, h_eye, glow):
-        cx, cy = center
-        # shape: estreita elipse inclinada para dar cara de fissura
-        # control skew by creating polygon that approximates a slit
-        skew = w_eye * 0.18
-        points = [
-            cx - w_eye/2, cy - h_eye*0.35,
-            cx - w_eye*0.12 - skew, cy - h_eye*0.9,
-            cx + w_eye*0.12 + skew, cy - h_eye*0.9,
-            cx + w_eye/2, cy - h_eye*0.35,
-            cx + w_eye*0.12, cy + h_eye*0.15,
-            cx - w_eye*0.12, cy + h_eye*0.15
-        ]
-        # interior branco brilhante (intensidade pelo glow)
-        white_strength = int(220 + 35 * min(1.0, glow))
-        fill = f"#{white_strength:02x}{white_strength:02x}{white_strength:02x}"
-        self.canvas.create_polygon(points, fill=fill, outline="")
-        # sutil contorno azul-escuro
-        self.canvas.create_line(points[0], points[1], points[2], points[3], fill="#101214", width=1, smooth=True)
-
-        # brilho exterior quando falando
-        if glow > 0.2:
-            bloom = int(90 * min(1.0, glow))
-            # não há alpha; usar um tom acinzentado amarelado para simular glow
-            glow_color = f"#{80 + bloom:02x}{80 + bloom:02x}{100 + bloom//2:02x}"
-            self.canvas.create_oval(cx - w_eye*0.9, cy - h_eye*1.1, cx + w_eye*0.9, cy + h_eye*0.1,
-                                    outline=glow_color, width=2)
-
-    """
-    FriendlyRobotFaceWidget - Rosto de I.A. (Robô) amigável e expressivo,
-    com formas suaves, olhos grandes e brilhantes, e boca de luz suave.
-    Mantém a API usada pelo app:
-      - set_estado(estado)
-      - marcar_fala(segundos, intensity=1.0)
-      - set_mouth_intensity(intensity)
-      - set_mouth_level(level)
-      - clear_mouth_override()
-    """
-
-    def __init__(self, parent):
-        self._math = math
-        self._random = random
-
-        # Fundo mais suave, com tons de azul e roxo claros
-        self.canvas = tk.Canvas(parent, bg="#e0f0ff", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-
-        # estado e animações
-        self.estado = "sleep"  # idle | listening | speaking | sleep
-        self.boca_fase = 0.0
-        self.glow_fase = 0.0
-        # Reutilizaremos glow_fase para a maioria das animações de brilho e movimento sutil.
-
-        # controle boca
-        self.mouth_intensity = 1.0
-        self.mouth_level_override = None
-        self.fala_ate = 0.0
-
-        # piscar (agora um "ciclo de calibração" ou "descanso")
-        self.piscando = False
-        self.ultimo_piscar = time.time()
-        self.intervalo_piscar = 4.0 # Pisca menos frequentemente, mais calmamente
-        self.intervalo_piscar_sono = 10.0 # Ainda mais calmo
-
-        # olhar suave (mais como um olhar curioso)
-        self.eye_smooth = (0.0, 0.0)
-
-        # partículas decorativas (agora como "fagulhas" ou "dados alegres")
-        self.particulas = []
-        self._init_particulas()
-
-        # loop de atualização
-        self.update_interval = 40  # ms (~25 fps) - Mais suave que o anterior
-        self.canvas.after(self.update_interval, self._loop)
-
-    def _init_particulas(self):
-        self.particulas.clear()
-        # Partículas mais brilhantes e flutuantes
-        for _ in range(25):
-            self.particulas.append(
-                {"x": self._random.random(), "y": self._random.random(),
-                 "r": self._random.uniform(1.5, 3.5), # Um pouco maiores e mais visíveis
-                 "vy": self._random.uniform(0.002, 0.005), # Subindo lentamente
-                 "vx": self._random.uniform(-0.0003, 0.0003),
-                 "color": self._random.choice(["#c6e9ff", "#e0ffff", "#ffffff", "#ffe0e0"]) # Cores mais claras/pastéis
-                 }
+        cores = ["#030608", "#060A12", "#0A101C", "#080C16", "#030509"]
+        for i, c in enumerate(cores):
+            self.canvas.create_rectangle(
+                0, (h/len(cores))*i, w, (h/len(cores))*(i+1),
+                fill=c, outline=""
             )
-
-    # API pública (mantida)
-    def set_estado(self, estado: str):
-        self.estado = estado
-        if estado == "speaking":
-            self.boca_fase = 0.0
-
-    def set_mouth_intensity(self, intensity: float):
-        try:
-            v = float(intensity)
-        except Exception:
-            return
-        self.mouth_intensity = max(0.1, min(3.0, v))
-
-    def set_mouth_level(self, level: float):
-        try:
-            v = float(level)
-        except Exception:
-            return
-        self.mouth_level_override = max(0.0, min(1.0, v))
-
-    def clear_mouth_override(self):
-        self.mouth_level_override = None
-
-    def marcar_fala(self, segundos=2.0, intensity=1.0):
-        agora = time.time()
-        self.fala_ate = max(self.fala_ate, agora + segundos)
-        self.set_mouth_intensity(intensity)
-
-    # loop
-    def _loop(self):
-        agora = time.time()
-        if self.estado == "speaking":
-            self.boca_fase += 1.5 * self.mouth_intensity # Movimento suave
-        else:
-            self.boca_fase = max(0.0, self.boca_fase - 0.5) # Volta suavemente
-
-        self.glow_fase += 0.8 # Animações de brilho e pulsação
-
-        # piscar automático (mais calmo)
-        intervalo = self.intervalo_piscar_sono if self.estado == "sleep" else self.intervalo_piscar
-        if not self.piscando and (agora - self.ultimo_piscar) > intervalo:
-            self.piscando = True
-            self.ultimo_piscar = agora
-        elif self.piscando and (agora - self.ultimo_piscar) > 0.15: # Pisca mais lentamente
-            self.piscando = False
-
-        # olhar segue leve o cursor (suavizado e "curioso")
-        try:
-            px = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
-            py = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
-            w = self.canvas.winfo_width() or 800
-            h = self.canvas.winfo_height() or 450
-            cx = w / 2
-            cy = h / 2.2
-            dx = (px - cx) / max(1.0, w)
-            dy = (py - cy) / max(1.0, h)
-            # Limite do movimento mais amplo, como um olhar curioso
-            dx = max(-0.5, min(0.5, dx))
-            dy = max(-0.4, min(0.4, dy))
-            sx, sy = self.eye_smooth
-            sx += (dx - sx) * 0.18 # Movimento mais suave
-            sy += (dy - sy) * 0.18
-            self.eye_smooth = (sx, sy)
-        except Exception:
-            self.eye_smooth = (0.0, 0.0)
-
-        self._desenhar()
-        self.canvas.after(self.update_interval, self._loop)
-
-    # desenho principal
-    def _desenhar(self):
-        self.canvas.delete("all")
-        w = self.canvas.winfo_width() or 900
-        h = self.canvas.winfo_height() or 520
-        cx = w / 2
-        cy = h / 2.2
-        size = min(w, h)
-
-        self._desenhar_fundo(w, h)
-        # Raio um pouco maior para uma face mais "fofinha"
-        self._desenhar_face(cx, cy, size * 0.48) 
-
-    def _desenhar_fundo(self, w, h):
-        # Gradiente suave de azul claro para roxo pastel
-        steps = 8
-        top = (224, 240, 255) # light blue
-        bot = (200, 220, 240) # soft purple
-        for i in range(steps):
-            t = i / max(1, steps - 1)
-            r = int(top[0] + (bot[0] - top[0]) * t)
-            g = int(top[1] + (bot[1] - top[1]) * t)
-            b = int(top[2] + (bot[2] - top[2]) * t)
-            self.canvas.create_rectangle(0, i * (h / steps), w, (i + 1) * (h / steps),
-                                         fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
-
-        # Partículas brilhantes e coloridas
         for p in self.particulas:
-            fator = 0.2 if self.estado == "sleep" else 1.0 # Mais lento dormindo
-            p["y"] -= p["vy"] * fator
-            p["x"] += p["vx"] * fator
-            if p["y"] < 0: # Reinicia na parte inferior
-                p["y"] = 1.0
-                p["x"] = self._random.random()
+            p["x"] += p["vx"]
+            p["y"] -= p["vy"]
+            if p["y"] < 0:
+                p["y"] = 1
+                p["x"] = random.random()
             x = p["x"] * w
             y = p["y"] * h
             r = p["r"]
-            
-            # Cor da partícula
-            part_color = p["color"]
-            if self.estado == "sleep":
-                # Escurece a partícula quando dormindo
-                r_c = int(int(part_color[1:3], 16) * 0.5)
-                g_c = int(int(part_color[3:5], 16) * 0.5)
-                b_c = int(int(part_color[5:7], 16) * 0.5)
-                part_color = f"#{r_c:02x}{g_c:02x}{b_c:02x}"
+            glow = f"#{int(40+p['alpha']*80):02x}{int(120+p['alpha']*80):02x}{255:02x}"
+            self.canvas.create_oval(x-r, y-r, x+r, y+r, fill=glow, outline="")
 
-            self.canvas.create_oval(x - r, y - r, x + r, y + r, fill=part_color, outline="", width=0)
-            # Adiciona um efeito de "bloom" para as partículas
-            self.canvas.create_oval(x - r*0.7, y - r*0.7, x + r*0.7, y + r*0.7, fill=part_color, stipple="gray25")
+    def _desenhar_visor(self, w, h):
+        margem_x = w * 0.20
+        margem_y = h * 0.16
+        x1, y1 = margem_x, margem_y
+        x2, y2 = w - margem_x, h - margem_y
+        cx, cy = (x1+x2)/2, (y1+y2)/2
+        raio = min(w, h) * 0.06
 
-    def _desenhar_face(self, cx, cy, radius):
-        m = self._math
-        
-        # --- Face (Forma Oval/Arredondada e Cores Amigáveis) ---
-        face_w = radius * 1.6 # Mais largo
-        face_h = radius * 1.5 # Levemente achatado
-        
-        # Base da face (branco/cinza claro, com contorno suave)
-        face_fill = "#f0f8ff" # Branco azulado
-        face_outline = "#d0e0ed" # Contorno cinza claro
-        
-        # Cria a face como um oval grande e suave
-        self.canvas.create_oval(cx - face_w/2, cy - face_h/2, cx + face_w/2, cy + face_h/2, 
-                                fill=face_fill, outline=face_outline, width=3, tags="face_robot")
+        base = 140 if self.estado == "speaking" else 110 if self.estado == "listening" else 70
+        brilho = base + int(40 * abs((self.glow_fase % 60) - 30)/30)
+        cor_neon = f"#{(brilho//2):02x}{brilho:02x}{255:02x}"
 
-        # Pequenos "botões" decorativos nos lados (detalhes amigáveis)
-        button_r = radius * 0.05
-        btn_y = cy + face_h * 0.1
-        btn_x_offset = face_w * 0.4
-        self.canvas.create_oval(cx - btn_x_offset - button_r, btn_y - button_r,
-                                 cx - btn_x_offset + button_r, btn_y + button_r,
-                                 fill="#a0d0ff", outline="#70a0d0", width=1)
-        self.canvas.create_oval(cx + btn_x_offset - button_r, btn_y - button_r,
-                                 cx + btn_x_offset + button_r, btn_y + button_r,
-                                 fill="#a0d0ff", outline="#70a0d0", width=1)
-
-
-        # --- Olhos (Grandes, Brilhantes e Expressivos) ---
-        eye_w = face_w * 0.28 # Mais largos
-        eye_h = face_h * 0.25 # Mais altos
-        eye_y = cy - face_h * 0.2
-        sep = face_w * 0.28
-        
-        sx, sy = self.eye_smooth
-        left = (cx - sep + sx * face_w * 0.08, eye_y + sy * face_h * 0.06)
-        right = (cx + sep + sx * face_w * 0.08, eye_y + sy * face_h * 0.06)
-
-        self._draw_eye(left, eye_w, eye_h)
-        self._draw_eye(right, eye_w, eye_h)
-
-        # --- Boca (Barra de Luz Suave) ---
-        mouth_w = face_w * 0.5
-        mouth_h = face_h * 0.1
-        mouth_cx = cx
-        mouth_cy = cy + face_h * 0.35 # Um pouco mais para baixo, para um queixo amigável
-
-        agora = time.time()
-        
-        if self.mouth_level_override is not None:
-            intensity = self.mouth_level_override
-        elif self.estado == "speaking":
-            resto = max(0.0, self.fala_ate - agora)
-            base = 1.0 if resto > 0 else 0.4
-            intensity = min(1.5, base * self.mouth_intensity) # Intensidade suave
-        elif self.estado == "listening":
-            intensity = 0.25 # Levemente ativa
-        else:
-            intensity = 0.08 # Quase uma linha
-
-        # Altura da barra de luz
-        open_h = mouth_h * (0.2 + 0.8 * intensity) * (0.9 + 0.1 * abs(m.sin(self.boca_fase * 0.5)))
-        open_h = max(open_h, mouth_h * 0.1) # Altura mínima
-        
-        # Cor da boca (laranja quente para amigável)
-        mouth_color = "#ff8c42" if self.estado != "sleep" else "#ffc69a" 
-        
-        # Desenha a barra de luz da boca (Retângulo com cantos arredondados)
-        self.canvas.create_rectangle(mouth_cx - mouth_w/2, mouth_cy - open_h/2, 
-                                     mouth_cx + mouth_w/2, mouth_cy + open_h/2,
-                                     fill=mouth_color, outline="#e06a21", width=2, tags="mouth_light")
-        
-        # Adiciona um brilho sutil ao redor da boca quando ativo
-        if self.estado != "sleep":
-            glow_alpha = int(255 * (0.5 + 0.5 * m.sin(self.glow_fase * 0.3))) # Pulsa o brilho
-            self.canvas.create_oval(mouth_cx - mouth_w/2 - 5, mouth_cy - open_h/2 - 5,
-                                    mouth_cx + mouth_w/2 + 5, mouth_cy + open_h/2 + 5,
-                                    fill=f"#ffccaa{glow_alpha:02x}", outline="", tags="mouth_glow")
-
-
-        # Texto (Nome amigável ou etiqueta)
-        text_y_offset = face_h/2 + 10 # Mais próximo do corpo
-        text_color = "#60a0e0" if self.estado != "sleep" else "#a0b0c0" # Azul amigável
-        
-        self.canvas.create_text(cx, cy + text_y_offset, text="Hello! I'm Unit 734!",
-                                fill=text_color, font=("Comic Sans MS", max(10, int(radius*0.07)), "bold"))
-        
-        # Pequeno "medidor de energia" no topo da cabeça
-        top_bar_w = face_w * 0.3
-        top_bar_h = radius * 0.03
-        top_bar_y = cy - face_h/2 - top_bar_h - 5 # Acima da cabeça
-        energy_level = (m.sin(self.glow_fase * 0.1) + 1) / 2 # Pulsa de 0 a 1
-        energy_color = "#00ff77" if self.estado != "sleep" else "#506050"
-
-        self.canvas.create_rectangle(cx - top_bar_w/2, top_bar_y, cx + top_bar_w/2, top_bar_y + top_bar_h,
-                                     fill="#303540", outline="#607080", width=1)
-        self.canvas.create_rectangle(cx - top_bar_w/2, top_bar_y, cx - top_bar_w/2 + top_bar_w * energy_level, top_bar_y + top_bar_h,
-                                     fill=energy_color, outline="", tags="energy_bar")
-
-
-    def _draw_eye(self, center, w_eye, h_eye):
-        cx, cy = center
-        m = self._math
-        
-        # Olho como um grande oval brilhante
-        
-        # Sclera (parte branca ou estrutura do olho)
-        sclera_fill = "#ffffff" # Branco puro para olhos amigáveis
-        sclera_outline = "#c0d0e0" # Contorno azul claro
-        self.canvas.create_oval(cx - w_eye/2, cy - h_eye/2, cx + w_eye/2, cy + h_eye/2, 
-                                fill=sclera_fill, outline=sclera_outline, width=2)
-
-        # Iris (pupila grande e colorida)
-        iris_r = min(w_eye, h_eye) * 0.35 # Iris maior
-        
-        # Offset pela perseguição do cursor (eye_smooth) - Movimento mais pronunciado
-        offx = self.eye_smooth[0] * (w_eye * 0.15)
-        offy = self.eye_smooth[1] * (h_eye * 0.1)
-        px = cx + offx
-        py = cy + offy
-
-        # Cor da íris (azul vibrante)
-        iris_color = "#007bff" if self.estado != "sleep" else "#004a80" 
-        self.canvas.create_oval(px - iris_r, py - iris_r, px + iris_r, py + iris_r, 
-                                fill=iris_color, outline="#0050aa", width=1)
-
-        # Pupila (preta)
-        pupil_r = iris_r * 0.55 # Pupila grande para fofura
-        self.canvas.create_oval(px - pupil_r, py - pupil_r, px + pupil_r, py + pupil_r, 
-                                fill="#101010", outline="", tags="pupil")
-
-        # Brilhos nos olhos (reflexo de luz para dar vida)
-        if self.estado != "sleep":
-            # Brilho principal (maior)
-            self.canvas.create_oval(px - pupil_r*0.7, py - pupil_r*1.1, px - pupil_r*0.2, py - pupil_r*0.5, 
-                                    fill="#ffffff", outline="", tags="eye_highlight_lg")
-            # Brilho secundário (menor)
-            self.canvas.create_oval(px + pupil_r*0.3, py + pupil_r*0.4, px + pupil_r*0.6, py + pupil_r*0.7, 
-                                    fill="#e0f0ff", outline="", tags="eye_highlight_sm")
-        
-        # piscar: pálpebra suave fechando
-        if self.piscando:
-            lid_color = sclera_fill # Cor da face para simular pálpebra
-            # Pálpebra superior e inferior fechando de forma suave
-            blink_prog = (time.time() - self.ultimo_piscar) / 0.15 # 0 a 1 em 0.15s
-            if blink_prog < 0.5: # Fechando
-                lid_h_top = h_eye * (blink_prog * 2)
-                lid_h_bot = h_eye * (blink_prog * 2)
-            else: # Abrindo
-                lid_h_top = h_eye * (2 - blink_prog * 2)
-                lid_h_bot = h_eye * (2 - blink_prog * 2)
-            
-            # Cima
-            self.canvas.create_arc(cx - w_eye/2, cy - h_eye/2, cx + w_eye/2, cy + h_eye/2 + lid_h_top,
-                                   start=0, extent=180, fill=lid_color, outline=sclera_outline, width=2, style=tk.ARC)
-            # Baixo
-            self.canvas.create_arc(cx - w_eye/2, cy - h_eye/2 - lid_h_bot, cx + w_eye/2, cy + h_eye/2,
-                                   start=180, extent=180, fill=lid_color, outline=sclera_outline, width=2, style=tk.ARC)
-    """
-    RobotFaceWidget V3: Rosto de I.A. altamente detalhado e animado, com
-    melhores reflexos metálicos, olho-sensor com varredura e boca em equalizador.
-    Mantém a API usada pelo app:
-      - set_estado(estado)
-      - marcar_fala(segundos, intensity=1.0)
-      - set_mouth_intensity(intensity)
-      - set_mouth_level(level)
-      - clear_mouth_override()
-    """
-
-    def __init__(self, parent):
-        import math
-        import time
-        import random
-        import tkinter as tk 
-        self._math = math
-        self._random = random 
-
-        # Fundo mais escuro e tecnológico
-        self.canvas = tk.Canvas(parent, bg="#10151a", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-
-        # estado e animações
-        self.estado = "sleep"  # idle | listening | speaking | sleep
-        self.boca_fase = 0.0
-        self.glow_fase = 0.0
-        # Adicionei uma nova variável de fase para animação dos olhos, já que não posso mudar o __init__
-        # Vamos usar a 'glow_fase' para varredura do olho e pulsação.
-
-        # controle boca
-        self.mouth_intensity = 1.0
-        self.mouth_level_override = None
-        self.fala_ate = 0.0
-
-        # piscar (agora mais um "ciclo de energia" rápido)
-        self.piscando = False
-        self.ultimo_piscar = time.time()
-        self.intervalo_piscar = 2.5 # Pisca mais frequentemente
-        self.intervalo_piscar_sono = 7.0 # Pisca mais frequentemente
-
-        # olhar suave
-        self.eye_smooth = (0.0, 0.0)
-
-        # partículas decorativas (agora digitais/código)
-        self.particulas = []
-        self._init_particulas()
-
-        # loop de atualização
-        self.update_interval = 30 # ms (~33 fps) - Animação mais fluida
-        self.canvas.after(self.update_interval, self._loop)
-
-    def _init_particulas(self):
-        self.particulas.clear()
-        # Partículas digitais em maior quantidade e brilho
-        for _ in range(30):
-            self.particulas.append(
-                # Adicionei vx para um leve movimento lateral robótico
-                {"x": self._random.random(), "y": self._random.random(), "r": self._random.uniform(1.0, 2.5), 
-                 "vy": self._random.uniform(0.004, 0.008), "vx": self._random.uniform(-0.0005, 0.0005)}
+        for halo in range(6):
+            self._round_rect(
+                x1-halo*2, y1-halo*2, x2+halo*2, y2+halo*2,
+                radius=raio+halo*1.6,
+                outline=cor_neon, width=1,
             )
+        self._round_rect(x1, y1, x2, y2, radius=raio, fill="#05070D", outline=cor_neon, width=3)
+        self._round_rect(x1+6, y1+6, x2-6, y2-6, radius=raio-5, fill="#020307", outline="")
 
-    # API pública (mantida)
-    def set_estado(self, estado: str):
-        self.estado = estado
-        if estado == "speaking":
-            self.boca_fase = 0.0
+        self._desenhar_olhos(cx, cy, x1, x2, y1, y2, cor_neon)
+        self._desenhar_boca(cx, cy, x1, x2, y1, y2, cor_neon)
 
-    def set_mouth_intensity(self, intensity: float):
-        try:
-            v = float(intensity)
-        except Exception:
-            return
-        self.mouth_intensity = max(0.1, min(3.0, v))
+        self.canvas.create_text(
+            cx, y2 + h*0.035, text="Jarvis", fill=cor_neon,
+            font=("Segoe UI", max(18, int(h*0.04)), "bold")
+        )
 
-    def set_mouth_level(self, level: float):
-        try:
-            v = float(level)
-        except Exception:
-            return
-        self.mouth_level_override = max(0.0, min(1.0, v))
-
-    def clear_mouth_override(self):
-        self.mouth_level_override = None
-
-    def marcar_fala(self, segundos=2.0, intensity=1.0):
+    def _desenhar_olhos(self, cx, cy, x1, x2, y1, y2, cor):
+        espacamento = (x2 - x1) * 0.36
+        r = min((x2-x1), (y2-y1)) * 0.12
+        olhos = [(cx - espacamento/2, cy - r*0.25), (cx + espacamento/2, cy - r*0.25)]
         agora = time.time()
-        self.fala_ate = max(self.fala_ate, agora + segundos)
-        self.set_mouth_intensity(intensity)
-
-    # loop
-    def _loop(self):
-        agora = time.time()
-        if self.estado == "speaking":
-            # Movimento da boca/barra mais rápido e responsivo
-            self.boca_fase += 2.2 * self.mouth_intensity
-        else:
-            self.boca_fase = max(0.0, self.boca_fase - 0.9) # Recuo mais rápido
-
-        self.glow_fase += 1.0 # Mais rápido para pulsação e varredura
-
-        # piscar automático (mais rápido/curto)
         intervalo = self.intervalo_piscar_sono if self.estado == "sleep" else self.intervalo_piscar
         if not self.piscando and (agora - self.ultimo_piscar) > intervalo:
             self.piscando = True
             self.ultimo_piscar = agora
-        elif self.piscando and (agora - self.ultimo_piscar) > 0.06: # Pisca muito rápido (glitch)
+        elif self.piscando and (agora - self.ultimo_piscar) > 0.16:
             self.piscando = False
-
-        # olhar segue leve o cursor (suavizado) - Mais responsivo/robótico
-        try:
-            px = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
-            py = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
-            w = self.canvas.winfo_width() or 800
-            h = self.canvas.winfo_height() or 450
-            cx = w / 2
-            cy = h / 2.2
-            dx = (px - cx) / max(1.0, w)
-            dy = (py - cy) / max(1.0, h)
-            # Limite do movimento mais contido (mais como um sensor)
-            dx = max(-0.35, min(0.35, dx))
-            dy = max(-0.25, min(0.25, dy))
-            sx, sy = self.eye_smooth
-            sx += (dx - sx) * 0.28 # Mais responsivo
-            sy += (dy - sy) * 0.28
-            self.eye_smooth = (sx, sy)
-        except Exception:
-            self.eye_smooth = (0.0, 0.0)
-
-        self._desenhar()
-        self.canvas.after(self.update_interval, self._loop)
-
-    # desenho principal
-    def _desenhar(self):
-        self.canvas.delete("all")
-        w = self.canvas.winfo_width() or 900
-        h = self.canvas.winfo_height() or 520
-        cx = w / 2
-        cy = h / 2.2
-        size = min(w, h)
-
-        self._desenhar_fundo(w, h)
-        # Passa um raio menor para a face robótica
-        self._desenhar_face(cx, cy, size * 0.40) 
-
-    def _desenhar_fundo(self, w, h):
-        # gradiente mais profundo (tons de azul ciber/preto)
-        steps = 8
-        top = (12, 16, 20)
-        bot = (25, 30, 40)
-        for i in range(steps):
-            t = i / max(1, steps - 1)
-            r = int(top[0] + (bot[0] - top[0]) * t)
-            g = int(top[1] + (bot[1] - top[1]) * t)
-            b = int(top[2] + (bot[2] - top[2]) * t)
-            import tkinter as tk # Manter o import
-            self.canvas.create_rectangle(0, i * (h / steps), w, (i + 1) * (h / steps),
-                                         fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
-
-        # partículas discretas (digitais/ciber)
-        for p in self.particulas:
-            fator = 0.3 if self.estado == "sleep" else 1.0
-            p["y"] -= p["vy"] * fator
-            p["x"] += p["vx"] * fator # Movimento lateral
-            if p["y"] < 0 or p["x"] < 0 or p["x"] > 1:
-                p["y"] = 1.0
-                p["x"] = self._random.random()
-            x = p["x"] * w
-            y = p["y"] * h
-            r = p["r"]
-            
-            # Cor ciano/verde neon com mais brilho
-            part_color = "#00ffc6" if self.estado != "sleep" else "#005544" 
-            
-            # Adiciona um brilho sutil
-            self.canvas.create_oval(x - r, y - r, x + r, y + r, fill=part_color, outline="")
-            self.canvas.create_oval(x - r*0.5, y - r*0.5, x + r*0.5, y + r*0.5, fill="#99ffea", tags="part_shine")
-
-    def _desenhar_face(self, cx, cy, radius):
-        m = self._math
-        # --- Face Robótica (Forma de Quadrado/Retângulo com cantos arredondados) ---
-        face_w = radius * 1.8 
-        face_h = radius * 1.6
-        face_fill = "#3a4752" # Cinza escuro metálico
-        face_outline = "#808a90" # Contorno prateado/borda mais claro
-        
-        # Cria a face como um retângulo
-        self.canvas.create_rectangle(cx - face_w/2, cy - face_h/2, cx + face_w/2, cy + face_h/2, 
-                                     fill=face_fill, outline=face_outline, width=4, tags="face_robot")
-
-        # Reflexo de luz no topo para dar efeito 3D (detalhe)
-        self.canvas.create_rectangle(cx - face_w/2 + 2, cy - face_h/2 + 2, cx + face_w/2 - 2, cy - face_h/2 + face_h*0.08,
-                                     fill="#606d78", tags="face_highlight")
-
-        # Placa interna (visor)
-        visor_w = face_w * 0.9
-        visor_h = face_h * 0.9
-        self.canvas.create_rectangle(cx - visor_w/2, cy - visor_h/2, cx + visor_w/2, cy + visor_h/2, 
-                                     fill="#1a222b", outline="#606c74", width=2)
-        
-        # --- Olhos (Sensores Retangulares/LED) ---
-        eye_w = face_w * 0.35
-        eye_h = face_h * 0.10
-        eye_y = cy - face_h * 0.28
-        sep = face_w * 0.3
-        
-        # Posição dos olhos ajustada pelo movimento do sensor (eye_smooth)
-        sx, sy = self.eye_smooth
-        left = (cx - sep + sx * face_w * 0.1, eye_y + sy * face_h * 0.05)
-        right = (cx + sep + sx * face_w * 0.1, eye_y + sy * face_h * 0.05)
-
-        self._draw_eye(left, eye_w, eye_h)
-        self._draw_eye(right, eye_w, eye_h)
-
-        # --- Detalhes abaixo do olho (conexões/ventilação) ---
-        detail_y = cy - face_h * 0.05
-        detail_w = face_w * 0.7
-        detail_h = 4
-        self.canvas.create_rectangle(cx - detail_w/2, detail_y - detail_h/2, cx + detail_w/2, detail_y + detail_h/2,
-                                     fill="#28333b", outline="#404a55", width=1)
-        # Linhas de ventilação/detalhes
-        for i in range(5):
-             line_x = cx - detail_w/2 + (i + 1) * (detail_w / 6)
-             self.canvas.create_line(line_x, detail_y - detail_h/2 + 1, line_x, detail_y + detail_h/2 - 1, 
-                                     fill="#505a60", width=1)
-
-
-        # --- Boca (Barra de Som Digital Aprimorada - Equalizador) ---
-        mouth_w = face_w * 0.6
-        mouth_h = face_h * 0.15 # Um pouco mais alta
-        mouth_cx = cx
-        mouth_cy = cy + face_h * 0.30
-
-        agora = time.time()
-        
-        # Calcula a intensidade (Mantido o cálculo original)
-        if self.mouth_level_override is not None:
-            intensity = self.mouth_level_override
-        elif self.estado == "speaking":
-            resto = max(0.0, self.fala_ate - agora)
-            base = 1.0 if resto > 0 else 0.5
-            intensity = min(1.8, base * self.mouth_intensity) # Maior range de movimento
-        elif self.estado == "listening":
-            intensity = 0.30
-        else:
-            intensity = 0.10
-
-        # Fundo do display da boca
-        self.canvas.create_rectangle(mouth_cx - mouth_w/2 - 1, mouth_cy - mouth_h/2 - 1, 
-                                     mouth_cx + mouth_w/2 + 1, mouth_cy + mouth_h/2 + 1, 
-                                     fill="#050a10", outline="#1a222b", width=1)
-
-
-        # Simulação do Equalizador com 5 barras dentro da área da boca
-        num_bars = 5
-        bar_spacing = mouth_w / (num_bars + 1)
-        bar_width = bar_spacing * 0.6
-        
-        for i in range(num_bars):
-            # Onda de som individual para cada barra, para mais movimento
-            bar_intensity = intensity * (0.6 + 0.4 * m.sin(self.boca_fase * (0.2 + i*0.1) + i*0.8))
-            bar_height = mouth_h * (0.15 + 0.85 * bar_intensity)
-            bar_height = max(bar_height, mouth_h * 0.1) # Altura mínima da barra
-            
-            bar_x = mouth_cx - mouth_w/2 + (i+1) * bar_spacing - bar_width/2
-            
-            # Cor ciano brilhante/LED
-            bar_color = "#00ffc6"
-            if self.estado == "sleep":
-                bar_color = "#005544"
-            elif intensity > 0.8:
-                bar_color = "#00ffea" # Mais claro quando intenso
-
-            self.canvas.create_rectangle(bar_x, mouth_cy + mouth_h/2 - bar_height,
-                                         bar_x + bar_width, mouth_cy + mouth_h/2,
-                                         fill=bar_color, outline="", tags="eq_bar")
-            
-            # Reflexo no topo da barra (detalhe)
-            self.canvas.create_rectangle(bar_x, mouth_cy + mouth_h/2 - bar_height,
-                                         bar_x + bar_width, mouth_cy + mouth_h/2 - bar_height + 1,
-                                         fill="#99ffea")
-
-
-        # Detalhe de texto/placa (Nome do Robô/Modelo)
-        text_y_offset = face_h/2 + 18
-        text_color = "#00ffc6" if self.estado != "sleep" else "#004030"
-        
-        # Efeito de brilho pulsante no texto (mais animado)
-        if self.estado != "sleep":
-            glow_intensity = (m.sin(self.glow_fase * 0.2) + 1) / 4 + 0.7 
-            glow_color = f"#{int(0x00 * glow_intensity):02x}{int(0xff * glow_intensity):02x}{int(0xc6 * glow_intensity):02x}"
-            self.canvas.create_text(cx + 1, cy + text_y_offset + 1, text="UNIT 734", 
-                                    fill=glow_color, font=("Digital-7", max(10, int(radius*0.1)), "bold"))
-
-        self.canvas.create_text(cx, cy + text_y_offset, text="UNIT 734",
-                                fill=text_color, font=("Digital-7", max(10, int(radius*0.1)), "bold"))
-
-    def _draw_eye(self, center, w_eye, h_eye):
-        cx, cy = center
-        m = self._math
-        
-        # Olho como um sensor complexo (estrutura)
-        
-        # Fundo/Estrutura do sensor
-        sensor_color = "#15202a"
-        self.canvas.create_rectangle(cx - w_eye/2, cy - h_eye/2, cx + w_eye/2, cy + h_eye/2, 
-                                     fill=sensor_color, outline="#404a55", width=2)
-        
-        # Lente interna mais escura
-        self.canvas.create_rectangle(cx - w_eye*0.45, cy - h_eye*0.4, cx + w_eye*0.45, cy + h_eye*0.4, 
-                                     fill="#0a1015", outline="#202530", width=1)
-
-
-        # O sensor interno (pupila robótica/lente)
-        pupil_w = w_eye * 0.4
-        pupil_h = h_eye * 0.6
-        
-        # Offset pela perseguição do cursor (eye_smooth)
-        offx = self.eye_smooth[0] * (w_eye * 0.15)
-        offy = self.eye_smooth[1] * (h_eye * 0.08)
-        px = cx + offx
-        py = cy + offy
-
-        # Cor do sensor (LED Azul/Ciano)
-        if self.estado == "sleep":
-            led_color = "#002030" # Desligado/Fraco
-            outline_color = "#004050"
-        else:
-            led_color = "#00c6ff" # Aceso
-            outline_color = "#006688"
-        
-        # Desenha o "LED" retangular
-        self.canvas.create_rectangle(px - pupil_w/2, py - pupil_h/2, 
-                                     px + pupil_w/2, py + pupil_h/2, 
-                                     fill=led_color, outline=outline_color, width=1)
-        
-        # --- Efeito de Varredura/Scanner Animado ---
-        if self.estado != "sleep":
-            # Pulsação do brilho
-            glow_intensity = (m.sin(self.glow_fase * 0.15) + 1) / 2 # Varia de 0 a 1
-            shine_r = min(pupil_w, pupil_h) * 0.3 * (0.8 + 0.5 * glow_intensity)
-            self.canvas.create_oval(px - shine_r, py - shine_r, px + shine_r, py + shine_r, 
-                                    fill=f"#b3f0ff{int(255*glow_intensity):02x}", outline="", tags="glow_effect")
-
-            # Linha de varredura (scanner) se movendo verticalmente
-            scan_pos = (m.sin(self.glow_fase * 0.08) + 1) / 2 # Varia de 0 a 1 mais lentamente
-            scan_y = py - pupil_h/2 + scan_pos * pupil_h
-            self.canvas.create_line(px - pupil_w/2, scan_y, px + pupil_w/2, scan_y,
-                                     fill="#80e0ff", width=2, tags="scan_line")
-            
-            # Reflexo branco na lente (detalhe)
-            self.canvas.create_line(cx - w_eye/2 + 2, cy - h_eye/2 + 2, cx + w_eye/2 - 2, cy - h_eye/2 + 2,
-                                     fill="#a0a8b0", width=1)
-
-
-        # piscar: Glitch de barra de energia
         if self.piscando:
-            blink_color = "#ff3333" # Vermelho vibrante para glitch
-            # Barra vertical central
-            self.canvas.create_rectangle(cx + offx - w_eye*0.4, cy + offy - h_eye*0.4,
-                                         cx + offx + w_eye*0.4, cy + offy + h_eye*0.4,
-                                         fill=blink_color, outline="#cc0000", width=1)
-            # Linhas de ruído horizontal (glitch)
-            for _ in range(3):
-                noise_y = cy + offy + self._random.uniform(-h_eye*0.3, h_eye*0.3)
-                noise_x_start = cx + offx + self._random.uniform(-w_eye*0.4, w_eye*0.2)
-                noise_x_end = cx + offx + self._random.uniform(-w_eye*0.2, w_eye*0.4)
-                self.canvas.create_line(noise_x_start, noise_y, noise_x_end, noise_y,
-                                         fill="#101010", width=1.5)
-    """
-    RobotFaceWidget - Rosto de I.A. (Robô) com cores metálicas, olhos de LED
-    e boca de barra de som.
-    Mantém a API usada pelo app:
-      - set_estado(estado)
-      - marcar_fala(segundos, intensity=1.0)
-      - set_mouth_intensity(intensity)
-      - set_mouth_level(level)
-      - clear_mouth_override()
-    """
-
-    def __init__(self, parent):
-        import math
-        import time
-        import random
-        import tkinter as tk # Adicionei o tk aqui para ser completo, se precisar.
-        self._math = math
-        self._random = random # Usei _random para as partículas.
-
-        # Fundo mais escuro e tecnológico
-        self.canvas = tk.Canvas(parent, bg="#10151a", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-
-        # estado e animações
-        self.estado = "sleep"  # idle | listening | speaking | sleep
-        self.boca_fase = 0.0
-        self.glow_fase = 0.0
-
-        # controle boca
-        self.mouth_intensity = 1.0
-        self.mouth_level_override = None
-        self.fala_ate = 0.0
-
-        # piscar (agora mais um "ciclo de energia" rápido)
-        self.piscando = False
-        self.ultimo_piscar = time.time()
-        self.intervalo_piscar = 3.0
-        self.intervalo_piscar_sono = 8.0
-
-        # olhar suave
-        self.eye_smooth = (0.0, 0.0)
-
-        # partículas decorativas (agora digitais/código)
-        self.particulas = []
-        self._init_particulas()
-
-        # loop de atualização
-        self.update_interval = 40  # ms (~25 fps) - Um pouco mais rápido
-        self.canvas.after(self.update_interval, self._loop)
-
-    def _init_particulas(self):
-        self.particulas.clear()
-        # Partículas digitais em maior quantidade
-        for _ in range(20): 
-            self.particulas.append(
-                # Adicionei vx para um leve movimento lateral robótico
-                {"x": self._random.random(), "y": self._random.random(), "r": self._random.uniform(1.0, 2.5), "vy": self._random.uniform(0.003, 0.007), "vx": self._random.uniform(-0.0002, 0.0002)}
-            )
-
-    # API pública (mantida)
-    def set_estado(self, estado: str):
-        self.estado = estado
-        if estado == "speaking":
-            self.boca_fase = 0.0
-
-    def set_mouth_intensity(self, intensity: float):
-        try:
-            v = float(intensity)
-        except Exception:
+            for x, y in olhos:
+                self.canvas.create_line(x-r, y, x+r, y, fill=cor, width=8, capstyle=tk.ROUND)
             return
-        self.mouth_intensity = max(0.1, min(3.0, v))
+        for x, y in olhos:
+            self.canvas.create_oval(x-r*1.25, y-r*1.25, x+r*1.25, y+r*1.25, outline=cor, width=2)
+            self.canvas.create_oval(x-r, y-r, x+r, y+r, outline=cor, width=5)
+            self.canvas.create_line(x - r*0.8, y, x + r*0.8, y, fill=cor, width=5, capstyle=tk.ROUND)
 
-    def set_mouth_level(self, level: float):
-        try:
-            v = float(level)
-        except Exception:
-            return
-        self.mouth_level_override = max(0.0, min(1.0, v))
-
-    def clear_mouth_override(self):
-        self.mouth_level_override = None
-
-    def marcar_fala(self, segundos=2.0, intensity=1.0):
+    def _desenhar_boca(self, cx, cy, x1, x2, y1, y2, cor):
+        largura = (x2 - x1) * 0.50
+        base_altura = (y2 - y1) * 0.20
+        intensidade = 0.15
         agora = time.time()
-        self.fala_ate = max(self.fala_ate, agora + segundos)
-        self.set_mouth_intensity(intensity)
-
-    # loop
-    def _loop(self):
-        agora = time.time()
-        if self.estado == "speaking":
-            # Movimento da boca/barra mais rápido
-            self.boca_fase += 1.8 * self.mouth_intensity
+        if self._mouth_override_level is not None and agora < self._mouth_override_until:
+            intensidade = 0.2 + min(0.8, self._mouth_override_level)
         else:
-            self.boca_fase = max(0.0, self.boca_fase - 0.7)
+            if self.estado == "speaking":
+                intensidade = self.boca_intensidade if (self.fala_ate - agora) > 0 else 0.33
+            elif self.estado == "listening":
+                intensidade = 0.16
+            elif self.estado == "sleep":
+                intensidade = 0.08
+        amp = base_altura * intensidade
+        altura = base_altura + amp * abs((self.boca_fase % 20) - 10) / 10
+        y_boca = cy + base_altura * 1.4
+        self.canvas.create_arc(
+            cx - largura/2, y_boca - altura/2, cx + largura/2, y_boca + altura/2,
+            start=200, extent=140, style=tk.ARC, outline=cor, width=6
+        )
 
-        self.glow_fase += 0.8
+    def _round_rect(self, x1, y1, x2, y2, radius=25, **kwargs):
+        pts = [x1+radius, y1, x2-radius, y1, x2, y1, x2, y1+radius, x2, y2-radius,
+               x2, y2, x2-radius, y2, x1+radius, y2, x1, y2, x1, y2-radius,
+               x1, y1+radius, x1, y1]
+        self.canvas.create_polygon(pts, smooth=True, **kwargs)
 
-        # piscar automático (mais rápido/curto)
-        intervalo = self.intervalo_piscar_sono if self.estado == "sleep" else self.intervalo_piscar
-        if not self.piscando and (agora - self.ultimo_piscar) > intervalo:
-            self.piscando = True
-            self.ultimo_piscar = agora
-        elif self.piscando and (agora - self.ultimo_piscar) > 0.08: # Mais rápido
-            self.piscando = False
 
-        # olhar segue leve o cursor (suavizado) - Mantido, mas mais rápido
-        try:
-            px = self.canvas.winfo_pointerx() - self.canvas.winfo_rootx()
-            py = self.canvas.winfo_pointery() - self.canvas.winfo_rooty()
-            w = self.canvas.winfo_width() or 800
-            h = self.canvas.winfo_height() or 450
-            cx = w / 2
-            cy = h / 2.2
-            dx = (px - cx) / max(1.0, w)
-            dy = (py - cy) / max(1.0, h)
-            # Limite do movimento mais contido (mais como um sensor)
-            dx = max(-0.4, min(0.4, dx))
-            dy = max(-0.3, min(0.3, dy))
-            sx, sy = self.eye_smooth
-            sx += (dx - sx) * 0.22 # Mais responsivo/robótico
-            sy += (dy - sy) * 0.22
-            self.eye_smooth = (sx, sy)
-        except Exception:
-            self.eye_smooth = (0.0, 0.0)
-
-        self._desenhar()
-        self.canvas.after(self.update_interval, self._loop)
-
-    # desenho principal
-    def _desenhar(self):
-        self.canvas.delete("all")
-        w = self.canvas.winfo_width() or 900
-        h = self.canvas.winfo_height() or 520
-        cx = w / 2
-        cy = h / 2.2
-        size = min(w, h)
-
-        self._desenhar_fundo(w, h)
-        # Passa um raio menor para a face robótica
-        self._desenhar_face(cx, cy, size * 0.40) 
-
-    def _desenhar_fundo(self, w, h):
-        # gradiente muito suave (Robótico: tons de azul escuro/ciber)
-        steps = 6
-        top = (16, 22, 30)
-        bot = (25, 38, 55)
-        for i in range(steps):
-            t = i / max(1, steps - 1)
-            r = int(top[0] + (bot[0] - top[0]) * t)
-            g = int(top[1] + (bot[1] - top[1]) * t)
-            b = int(top[2] + (bot[2] - top[2]) * t)
-            # Garantindo o import de tk para a criação de retângulos
-            import tkinter as tk 
-            self.canvas.create_rectangle(0, i * (h / steps), w, (i + 1) * (h / steps),
-                                         fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
-
-        # partículas discretas (digitais/ciber)
-        for p in self.particulas:
-            fator = 0.3 if self.estado == "sleep" else 1.0
-            p["y"] -= p["vy"] * fator
-            p["x"] += p["vx"] * fator # Movimento lateral
-            if p["y"] < 0 or p["x"] < 0 or p["x"] > 1:
-                p["y"] = 1.0
-                p["x"] = self._random.random()
-            x = p["x"] * w
-            y = p["y"] * h
-            r = p["r"]
-            
-            # Cor ciano/verde neon
-            part_color = "#00ffc6" if self.estado != "sleep" else "#005544" 
-            self.canvas.create_oval(x - r, y - r, x + r, y + r, fill=part_color, outline="")
-
-    def _desenhar_face(self, cx, cy, radius):
-        m = self._math
-        # --- Face Robótica (Forma de Quadrado/Retângulo com cantos arredondados) ---
-        face_w = radius * 1.8 
-        face_h = radius * 1.6
-        face_fill = "#3a4752" # Cinza escuro metálico
-        face_outline = "#7e90a0" # Contorno prateado/borda
-        
-        # Cria a face como um retângulo
-        self.canvas.create_rectangle(cx - face_w/2, cy - face_h/2, cx + face_w/2, cy + face_h/2, 
-                                     fill=face_fill, outline=face_outline, width=4, tags="face_robot")
-
-        # Placa interna (visor)
-        visor_w = face_w * 0.9
-        visor_h = face_h * 0.9
-        self.canvas.create_rectangle(cx - visor_w/2, cy - visor_h/2, cx + visor_w/2, cy + visor_h/2, 
-                                     fill="#28333b", outline="#606c74", width=2)
-        
-        # --- Olhos (Sensores Retangulares/LED) ---
-        eye_w = face_w * 0.35
-        eye_h = face_h * 0.10
-        eye_y = cy - face_h * 0.28
-        sep = face_w * 0.3
-        
-        # Posição dos olhos ajustada pelo movimento do sensor (eye_smooth)
-        sx, sy = self.eye_smooth
-        left = (cx - sep + sx * face_w * 0.1, eye_y + sy * face_h * 0.05)
-        right = (cx + sep + sx * face_w * 0.1, eye_y + sy * face_h * 0.05)
-
-        self._draw_eye(left, eye_w, eye_h)
-        self._draw_eye(right, eye_w, eye_h)
-
-        # Sobrancelhas (Removidas/Substituídas por Detalhes Robóticos)
-        # Bochechas e Nariz (Removidos para um visual mais limpo e robótico)
-
-        # --- Boca (Barra de Som Digital) ---
-        mouth_w = face_w * 0.6
-        mouth_h = face_h * 0.12
-        mouth_cx = cx
-        mouth_cy = cy + face_h * 0.30
-
-        agora = time.time()
-        
-        # Calcula a intensidade (Mantido o cálculo original)
-        if self.mouth_level_override is not None:
-            intensity = self.mouth_level_override
-        elif self.estado == "speaking":
-            resto = max(0.0, self.fala_ate - agora)
-            base = 0.9 if resto > 0 else 0.45
-            intensity = min(1.6, base * self.mouth_intensity)
-        elif self.estado == "listening":
-            intensity = 0.25 # Mais aberto ao ouvir
-        else:
-            intensity = 0.08 # Quase fechado/linha quando ocioso
-
-        # Altura da barra de som
-        # O movimento agora é a altura do retângulo (onda de som)
-        open_h = mouth_h * (0.1 + 0.9 * intensity) * (0.9 + 0.1 * abs(self._math.sin(self.boca_fase * 0.6)))
-        open_h = max(open_h, mouth_h * 0.1) # Altura mínima
-        
-        # Cor ciano brilhante/LED
-        mouth_color = "#00ffc6" if self.estado != "sleep" else "#005544" 
-        
-        # Desenha a barra de som (Retângulo)
-        self.canvas.create_rectangle(mouth_cx - mouth_w/2, mouth_cy - open_h/2, 
-                                     mouth_cx + mouth_w/2, mouth_cy + open_h/2,
-                                     fill=mouth_color, outline="#00aa88", width=1)
-
-        # Detalhe de texto/placa (Nome do Robô/Modelo)
-        self.canvas.create_text(cx, cy + face_h/2 + 18, text="UNIT 734", 
-                                fill="#00ffc6", font=("Digital-7", max(10, int(radius*0.1)), "bold"))
-
-    def _draw_eye(self, center, w_eye, h_eye):
-        cx, cy = center
-        m = self._math
-        
-        # Olho como um retângulo (visor/sensor)
-        
-        # Fundo/Estrutura do sensor
-        sensor_color = "#15202a"
-        self.canvas.create_rectangle(cx - w_eye/2, cy - h_eye/2, cx + w_eye/2, cy + h_eye/2, 
-                                     fill=sensor_color, outline="#606c74", width=2)
-
-        # O sensor interno (pupila robótica/lente)
-        pupil_w = w_eye * 0.4
-        pupil_h = h_eye * 0.6
-        
-        # Offset pela perseguição do cursor (eye_smooth)
-        offx = self.eye_smooth[0] * (w_eye * 0.2)
-        offy = self.eye_smooth[1] * (h_eye * 0.1)
-        px = cx + offx
-        py = cy + offy
-
-        # Cor do sensor (LED Azul/Ciano)
-        if self.estado == "sleep":
-            led_color = "#082030" # Desligado/Fraco
-            outline_color = "#103048"
-            glow = 0.0
-        else:
-            led_color = "#00c6ff" # Aceso
-            outline_color = "#006688"
-            glow = 0.1 * self._math.sin(self.glow_fase * 0.1) + 0.9 # Leve pulsação
-
-        # Desenha o "LED" retangular
-        self.canvas.create_rectangle(px - pupil_w/2, py - pupil_h/2, 
-                                     px + pupil_w/2, py + pupil_h/2, 
-                                     fill=led_color, outline=outline_color, width=1)
-        
-        # Brilho de energia (um círculo para simular o brilho de um sensor)
-        if self.estado != "sleep":
-            shine_r = min(pupil_w, pupil_h) * 0.35 * (1 + glow * 0.5)
-            self.canvas.create_oval(px - shine_r, py - shine_r, px + shine_r, py + shine_r, 
-                                    fill="#b3f0ff", stipple="gray50", tags="glow")
-
-        # piscar: barra de energia fechando
-        if self.piscando:
-            # Uma barra de "falha de sistema" temporária
-            lid_y = cy + offy
-            blink_color = "#ff4444" 
-            # Barra vertical no centro
-            self.canvas.create_line(cx + offx, cy - h_eye/2 + 2, 
-                                    cx + offx, cy + h_eye/2 - 2, 
-                                    fill=blink_color, width=int(w_eye * 0.9), capstyle=tk.BUTT)
-            # Detalhe horizontal para o "glitch"
-            self.canvas.create_line(cx - w_eye/2, cy, cx + w_eye/2, cy, 
-                                    fill="#101010", width=1)
-# -------------------- painel lateral --------------------
+# -------------------- Painel lateral --------------------
 
 class SidePanel:
     MODOS = ("PROJETO", "EQUIPE", "QR", "CONFIG")
@@ -1435,32 +255,21 @@ class SidePanel:
         self.frame.pack(side=tk.RIGHT, fill=tk.Y)
         self.frame.pack_propagate(False)
 
-        self.on_enter_config = None  # callback para atualizar portas
+        self.on_enter_config = None
 
-        titulo = tk.Label(
-            self.frame,
-            text="Alicia – Assistente de voz",
-            bg="#050509",
-            fg="#FFFFFF",
-            font=("Segoe UI", 22, "bold"),
-            wraplength=400,
-            pady=10,
-        )
-        titulo.pack(fill=tk.X, pady=(18, 4))
+        tk.Label(self.frame, text="Jarvis – Assistente de voz",
+                 bg="#050509", fg="#FFFFFF",
+                 font=("Segoe UI", 22, "bold"),
+                 wraplength=400, pady=10
+                 ).pack(fill=tk.X, pady=(18, 4))
 
-        sub = tk.Label(
-            self.frame,
-            text="ESP32-S3 + Xiaozhi",
-            bg="#050509",
-            fg="#B0BEC5",
-            font=("Segoe UI", 14),
-            wraplength=400,
-        )
-        sub.pack(fill=tk.X)
+        tk.Label(self.frame, text="ESP32-S3 + Xiaozhi",
+                 bg="#050509", fg="#B0BEC5",
+                 font=("Segoe UI", 14),
+                 wraplength=400
+                 ).pack(fill=tk.X)
 
-        ttk.Separator(self.frame, orient="horizontal").pack(
-            fill=tk.X, padx=16, pady=8
-        )
+        ttk.Separator(self.frame, orient="horizontal").pack(fill=tk.X, padx=16, pady=8)
 
         self.container = tk.Frame(self.frame, bg="#050509")
         self.container.pack(fill=tk.BOTH, expand=True, padx=16, pady=6)
@@ -1469,7 +278,6 @@ class SidePanel:
         self.page_equipe = tk.Frame(self.container, bg="#050509")
         self.page_qr = tk.Frame(self.container, bg="#050509")
         self.page_config = tk.Frame(self.container, bg="#050509")
-
         for p in (self.page_projeto, self.page_equipe, self.page_qr, self.page_config):
             p.place(relx=0, rely=0, relwidth=1, relheight=1)
 
@@ -1478,43 +286,21 @@ class SidePanel:
         self._build_qr()
         self._build_config()
 
-        ttk.Separator(self.frame, orient="horizontal").pack(
-            fill=tk.X, padx=16, pady=8
-        )
+        ttk.Separator(self.frame, orient="horizontal").pack(fill=tk.X, padx=16, pady=8)
 
         bf = tk.Frame(self.frame, bg="#050509")
         bf.pack(fill=tk.X, padx=16, pady=(0, 10))
 
-        btn_style = {
-            "bg": "#161824",
-            "fg": "#FFFFFF",
-            "activebackground": "#263238",
-            "activeforeground": "#FFFFFF",
-            "relief": tk.FLAT,
-            "padx": 8,
-            "pady": 7,
-            "font": ("Segoe UI", 12),
-        }
-
-        tk.Button(bf, text="Projeto", command=lambda: self.set_modo("PROJETO"), **btn_style).pack(fill=tk.X, pady=3)
+        btn_style = {"bg": "#161824", "fg": "#FFFFFF", "activebackground": "#263238",
+                     "activeforeground": "#FFFFFF", "relief": tk.FLAT, "padx": 8,
+                     "pady": 7, "font": ("Segoe UI", 12)}
+        tk.Button(bf, text="Info do Projeto", command=lambda: self.set_modo("PROJETO"), **btn_style).pack(fill=tk.X, pady=3)
         tk.Button(bf, text="Equipe", command=lambda: self.set_modo("EQUIPE"), **btn_style).pack(fill=tk.X, pady=3)
-        tk.Button(bf, text="QR + Links", command=lambda: self.set_modo("QR"), **btn_style).pack(fill=tk.X, pady=3)
+        tk.Button(bf, text="Outros Projetos", command=lambda: self.set_modo("QR"), **btn_style).pack(fill=tk.X, pady=3)
         tk.Button(bf, text="Configurações", command=lambda: self.set_modo("CONFIG"), **btn_style).pack(fill=tk.X, pady=(8, 3))
-
-        tk.Button(
-            bf,
-            text="Sair",
-            command=exit_cb,
-            bg="#111118",
-            fg="#CFD8DC",
-            activebackground="#263238",
-            activeforeground="#FFFFFF",
-            relief=tk.FLAT,
-            padx=8,
-            pady=6,
-            font=("Segoe UI", 11),
-        ).pack(fill=tk.X, pady=(10, 2))
-
+        tk.Button(bf, text="Sair", command=exit_cb, bg="#111118", fg="#CFD8DC",
+                  activebackground="#263238", activeforeground="#FFFFFF", relief=tk.FLAT,
+                  padx=8, pady=6, font=("Segoe UI", 11)).pack(fill=tk.X, pady=(10, 2))
 
         self.modo = "PROJETO"
         self.idx_auto = 0
@@ -1522,139 +308,126 @@ class SidePanel:
         self._raise_page(self.page_projeto)
 
     def _build_projeto(self):
-        tk.Label(
-            self.page_projeto,
-            text="Sobre o projeto",
-            bg="#050509",
-            fg="#FFFFFF",
-            font=("Segoe UI", 18, "bold"),
-            anchor="nw",
-            wraplength=380,
-        ).pack(anchor="nw", pady=(0, 8))
+        tk.Label(self.page_projeto, text="Sobre o projeto",
+                 bg="#050509", fg="#FFFFFF",
+                 font=("Segoe UI", 18, "bold"),
+                 anchor="nw", wraplength=380
+                 ).pack(anchor="nw", pady=(0, 8))
 
         texto = (
-            "Alicia é uma assistente de voz criada para ser uma opção mais acessível "
-            "e personalizável do que os assistentes comerciais, usando ESP32-S3 e o "
-            "firmware Xiaozhi.\n\n"
-            "Na prática, o usuário pode:\n"
-            "• Falar comandos (como faria com uma Alexa ou Google Assistente);\n"
-            "• Receber respostas de IA diretamente no dispositivo;\n"
-            "• Integrar a assistente com luzes, sensores, portas, ventiladores e outros "
-            "dispositivos do ambiente;\n"
-            "• Adaptar o comportamento da IA ao contexto de uso ou gostos pessoais.\n\n"
+            "Jarvis é uma assistente de voz mais acessível e personalizável, "
+            "construída com ESP32-S3 e o firmware Xiaozhi.\n\n"
+            "Benefícios:\n"
+            "• Comandos naturais por voz e respostas geradas por IA;\n"
+            "• Integração com dispositivos do ambiente (luzes, sensores, relés);\n"
+            "• Adaptação ao contexto (escola, casa, empresa).\n\n"
+            "Hardware do protótipo:\n"
+            "• ESP32-S3 com Xiaozhi;\n"
+            "• Microfone, amplificador de áudio e alto-falante.\n\n"
         )
-
-        tk.Label(
-            self.page_projeto,
-            text=texto,
-            bg="#050509",
-            fg="#CFD8DC",
-            font=("Segoe UI", 13),
-            anchor="nw",
-            justify="left",
-            wraplength=380,
-        ).pack(anchor="nw")
+        tk.Label(self.page_projeto, text=texto, bg="#050509", fg="#CFD8DC",
+                 font=("Segoe UI", 13), anchor="nw", justify="left", wraplength=380
+                 ).pack(anchor="nw")
 
     def _build_equipe(self):
-        tk.Label(
-            self.page_equipe,
-            text="Equipe",
-            bg="#050509",
-            fg="#FFFFFF",
-            font=("Segoe UI", 18, "bold"),
-            anchor="nw",
-        ).pack(anchor="nw", pady=(0, 8))
-
+        tk.Label(self.page_equipe, text="Equipe",
+                 bg="#050509", fg="#FFFFFF",
+                 font=("Segoe UI", 18, "bold"),
+                 anchor="nw"
+                 ).pack(anchor="nw", pady=(0, 8))
         membros = [
-            "• Josiel de Souza – Suporte de software",
-            "• Thiago – Suporte de software",
-            "• Cauan – Montagem e apoio técnico",
+            "• Josiel de Souza – Desenvolvimento e integração ESP32",
+            "• Thiago – Suporte de software / testes",
+            "• Cauã – Montagem de hardware e apoio técnico",
         ]
         for m in membros:
-            tk.Label(
-                self.page_equipe,
-                text=m,
-                bg="#050509",
-                fg="#CFD8DC",
-                font=("Segoe UI", 13),
-                anchor="nw",
-                wraplength=380,
-            ).pack(anchor="nw")
+            tk.Label(self.page_equipe, text=m, bg="#050509", fg="#CFD8DC",
+                     font=("Segoe UI", 13), anchor="nw", wraplength=380
+                     ).pack(anchor="nw")
 
     def _build_qr(self):
-        tk.Label(
-            self.page_qr,
-            text="Outros projetos",
-            bg="#050509",
-            fg="#FFFFFF",
-            font=("Segoe UI", 18, "bold"),
-            anchor="nw",
-        ).pack(anchor="nw", pady=(0, 8))
+        tk.Label(self.page_qr, text="Nossos outros projetos",
+                 bg="#050509", fg="#FFFFFF",
+                 font=("Segoe UI", 18, "bold"),
+                 anchor="nw"
+                 ).pack(anchor="nw", pady=(0, 8))
+        tk.Label(self.page_qr, text="Aponte a câmera para o QR Code:",
+                 bg="#050509", fg="#CFD8DC",
+                 font=("Segoe UI", 13), anchor="nw", wraplength=380
+                 ).pack(anchor="nw", pady=(0, 8))
 
-        tk.Label(
-            self.page_qr,
-            text="Aponte a câmera para o QR Code para conhecer nossos outros "
-                 "projetos:",
-            bg="#050509",
-            fg="#CFD8DC",
-            font=("Segoe UI", 13),
-            anchor="nw",
-            wraplength=380,
-        ).pack(anchor="nw", pady=(0, 8))
+        # Frame centralizado para a imagem
+        qr_frame = tk.Frame(self.page_qr, bg="#050509")
+        qr_frame.pack(fill=tk.BOTH, expand=True, pady=6)
 
-        tk.Label(
-            self.page_qr,
-            text="QR CODE AQUI",
-            bg="#0F1518",
-            fg="#90CAF9",
-            font=("Segoe UI", 15, "bold"),
-            relief=tk.GROOVE,
-            bd=1,
-            padx=16,
-            pady=36,
-        ).pack(fill=tk.X, pady=6)
+        # Caminho absoluto seguro
+        script_dir = os.path.abspath(os.path.dirname(sys.argv[0] or __file__))
+        qr_path = os.path.join(script_dir, QR_LOCAL_FILE)
 
+        # Parâmetros de tamanho máximos para caber bem no painel
+        max_w = 300  # largura máxima
+        max_h = 300  # altura máxima
+
+        if PIL_AVAILABLE:
+            try:
+                img = Image.open(qr_path)  # PNG/JPEG
+                # calcula a proporção para limitar a largura/altura
+                ratio_w = max_w / img.width
+                ratio_h = max_h / img.height
+                ratio = min(1.0, ratio_w, ratio_h)
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                img = img.resize(new_size, Image.LANCZOS)
+                self.qr_img = ImageTk.PhotoImage(img)
+
+                # Label da imagem centralizada
+                lbl_img = tk.Label(qr_frame, image=self.qr_img, bg="#050509")
+                lbl_img.pack(pady=4)
+            except Exception as e:
+                # Falha com Pillow -> tenta fallback com PhotoImage
+                self._qr_photoimage_fallback(qr_frame, qr_path, max_w, max_h)
+        else:
+            # Sem Pillow: tentar PhotoImage (funciona com PNG/GIF)
+            self._qr_photoimage_fallback(qr_frame, qr_path, max_w, max_h)
+
+    def _qr_photoimage_fallback(self, parent, qr_path, max_w, max_h):
+        try:
+            # Carrega imagem PNG/GIF
+            img = tk.PhotoImage(file=qr_path)
+            # Reduz usando subsample (inteiro). Calcula fator mínimo necessário.
+            # OBS: subsample só aceita inteiros; escolhemos um fator para caber em max_w/max_h
+            factor_w = max(1, int((img.width() + max_w - 1) // max_w))
+            factor_h = max(1, int((img.height() + max_h - 1) // max_h))
+            factor = max(1, min(factor_w, factor_h))
+
+            # Aplica subsample (reduz tamanho)
+            self.qr_img = img.subsample(factor, factor)
+
+            lbl_img = tk.Label(parent, image=self.qr_img, bg="#050509")
+            lbl_img.pack(pady=4)
+        except Exception as e:
+            # Placeholder caso não carregue
+            tk.Label(parent, text="QR CODE (salve 'qr.png' ao lado do script)",
+                     bg="#0F1518", fg="#90CAF9", font=("Segoe UI", 15, "bold"),
+                     relief=tk.GROOVE, bd=1, padx=16, pady=36).pack()
+            tk.Label(parent, text=f"Falha: {type(e).__name__}",
+                     bg="#050509", fg="#FF8080", font=("Segoe UI", 10)).pack(pady=(4, 0))
 
     def _build_config(self):
-        tk.Label(
-            self.page_config,
-            text="Configurações",
-            bg="#050509",
-            fg="#FFFFFF",
-            font=("Segoe UI", 18, "bold"),
-            anchor="nw",
-        ).pack(anchor="nw", pady=(0, 6))
-
+        tk.Label(self.page_config, text="Configurações",
+                 bg="#050509", fg="#FFFFFF", font=("Segoe UI", 18, "bold"),
+                 anchor="nw").pack(anchor="nw", pady=(0, 6))
         self.config_serial_host = tk.Frame(self.page_config, bg="#050509")
         self.config_serial_host.pack(fill=tk.X, pady=(4, 10))
-
-        tk.Label(
-            self.page_config,
-            text="Logs",
-            bg="#050509",
-            fg="#FFFFFF",
-            font=("Segoe UI", 14, "bold"),
-            anchor="nw",
-        ).pack(anchor="nw", pady=(8, 2))
-
+        tk.Label(self.page_config, text="Logs", bg="#050509", fg="#FFFFFF",
+                 font=("Segoe UI", 14, "bold"), anchor="nw").pack(anchor="nw", pady=(8, 2))
         logs_container = tk.Frame(self.page_config, bg="#050509")
         logs_container.pack(fill=tk.BOTH, expand=True)
-
-        self.text_logs = tk.Text(
-            logs_container,
-            bg="#0E1114",
-            fg="#D8DEE9",
-            font=("Consolas", 11),
-            relief=tk.FLAT,
-        )
-        scroll = ttk.Scrollbar(
-            logs_container, orient="vertical", command=self.text_logs.yview
-        )
+        self.text_logs = tk.Text(logs_container, bg="#0E1114", fg="#D8DEE9",
+                                 font=("Consolas", 11), relief=tk.FLAT)
+        scroll = ttk.Scrollbar(logs_container, orient="vertical", command=self.text_logs.yview)
         self.text_logs.config(yscrollcommand=scroll.set)
-
         self.text_logs.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(4, 0))
         scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=(4, 0))
-
         self.text_logs.config(state=tk.DISABLED)
         self.buffer_logs = []
 
@@ -1663,7 +436,6 @@ class SidePanel:
             return
         self.modo = modo
         self.auto = modo not in ("CONFIG",)
-
         if modo == "PROJETO":
             self._raise_page(self.page_projeto)
         elif modo == "EQUIPE":
@@ -1695,65 +467,44 @@ class SidePanel:
         self.set_modo(("PROJETO", "EQUIPE", "QR")[self.idx_auto])
 
 
-# -------------------- status bar --------------------
+# -------------------- Status bar --------------------
 
 class StatusBar:
     def __init__(self, parent):
         self.frame = tk.Frame(parent, bg="#050509", height=32)
         self.frame.pack(fill=tk.X, side=tk.BOTTOM)
-
-        self.lbl = tk.Label(
-            self.frame,
-            text="Alicia desconectada",
-            bg="#050509",
-            fg="#FFFFFF",
-            font=("Segoe UI", 13),
-            anchor="w",
-        )
+        self.lbl = tk.Label(self.frame, text="Jarvis desconectado",
+                            bg="#050509", fg="#FFFFFF",
+                            font=("Segoe UI", 13), anchor="w")
         self.lbl.pack(side=tk.LEFT, padx=16)
-
-        self.lbl_dots = tk.Label(
-            self.frame,
-            text="",
-            bg="#050509",
-            fg="#00E5FF",
-            font=("Consolas", 12, "bold"),
-            anchor="w",
-        )
+        self.lbl_dots = tk.Label(self.frame, text="", bg="#050509", fg="#00E5FF",
+                                 font=("Consolas", 12, "bold"), anchor="w")
         self.lbl_dots.pack(side=tk.LEFT)
-
         self.estado = "sleep"
         self.fase = 0
         self.frame.after(350, self._loop)
 
     def set_estado(self, estado: str):
         self.estado = estado
-        if estado == "listening":
-            txt = "Alicia está ouvindo"
-        elif estado == "speaking":
-            txt = "Alicia está respondendo"
-        elif estado == "sleep":
-            txt = "Alicia desconectada"
-        else:
-            txt = "Alicia pronta"
+        txt = ("Jarvis está ouvindo" if estado == "listening"
+               else "Jarvis está respondendo" if estado == "speaking"
+               else "Jarvis desconectado" if estado == "sleep"
+               else "Jarvis pronto")
         self.lbl.config(text=txt)
 
     def _loop(self):
-        if self.estado in ("listening", "speaking"):
-            dots = "." * ((self.fase % 3) + 1)
-        else:
-            dots = ""
+        dots = "." * ((self.fase % 3) + 1) if self.estado in ("listening", "speaking") else ""
         self.lbl_dots.config(text=dots)
         self.fase += 1
         self.frame.after(350, self._loop)
 
 
-# -------------------- app principal --------------------
+# -------------------- App principal --------------------
 
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Alicia – Assistente de voz (ESP32-S3 + Xiaozhi)")
+        self.root.title("Jarvis – Assistente de voz (ESP32-S3 + Xiaozhi)")
         self.root.configure(bg="#000000")
         self.root.attributes("-fullscreen", True)
         self.fullscreen = True
@@ -1778,26 +529,14 @@ class App:
         self.text_frame.pack_propagate(False)
 
         self.wrap_len = 1200
-        self.lbl_user = tk.Label(
-            self.text_frame,
-            text="",
-            bg="#020308",
-            fg="#7FD3FF",
-            font=("Segoe UI", 20, "italic"),
-            anchor="w",
-            wraplength=self.wrap_len,
-        )
+        self.lbl_user = tk.Label(self.text_frame, text="", bg="#020308",
+                                 fg="#7FD3FF", font=("Segoe UI", 20, "italic"),
+                                 anchor="w", wraplength=self.wrap_len)
         self.lbl_user.pack(fill=tk.X, padx=44, pady=(12, 4))
 
-        self.txt_ia = tk.Text(
-            self.text_frame,
-            bg="#020308",
-            fg="#FFFFFF",
-            font=("Segoe UI", 28, "bold"),
-            wrap="word",
-            relief=tk.FLAT,
-            height=3,
-        )
+        self.txt_ia = tk.Text(self.text_frame, bg="#020308", fg="#FFFFFF",
+                              font=("Segoe UI", 28, "bold"),
+                              wrap="word", relief=tk.FLAT, height=3)
         self.txt_ia.pack(fill=tk.BOTH, padx=44, pady=(0, 18))
         self.txt_ia.config(state=tk.DISABLED)
 
@@ -1820,71 +559,40 @@ class App:
 
         self.root.after(SIDE_CYCLE_INTERVAL, self._ciclo_painel)
 
-    # --- UI de serial ---
-
     def _montar_serial_ui(self, parent):
         frame = tk.Frame(parent, bg="#050509")
         frame.pack(fill=tk.X)
 
-        tk.Label(
-            frame, text="Conexão serial", bg="#050509", fg="#FFFFFF",
-            font=("Segoe UI", 12, "bold"),
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
-
-        tk.Label(
-            frame, text="Porta:", bg="#050509", fg="#CFD8DC",
-            font=("Segoe UI", 10),
-        ).grid(row=1, column=0, sticky="w")
+        tk.Label(frame, text="Conexão serial", bg="#050509", fg="#FFFFFF",
+                 font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        tk.Label(frame, text="Porta:", bg="#050509", fg="#CFD8DC",
+                 font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w")
 
         self.cb_port = ttk.Combobox(frame, width=16, state="readonly")
         self.cb_port.grid(row=1, column=1, padx=4)
+        tk.Button(frame, text="Atualizar", command=self._atualizar_portas,
+                  bg="#222532", fg="#FFFFFF", activebackground="#263238",
+                  activeforeground="#FFFFFF", relief=tk.FLAT,
+                  font=("Segoe UI", 9), padx=4, pady=2
+                  ).grid(row=1, column=2, padx=4)
 
-        tk.Button(
-            frame, text="Atualizar",
-            command=self._atualizar_portas,
-            bg="#222532", fg="#FFFFFF",
-            activebackground="#263238",
-            activeforeground="#FFFFFF",
-            relief=tk.FLAT,
-            font=("Segoe UI", 9),
-            padx=4, pady=2,
-        ).grid(row=1, column=2, padx=4)
-
-        tk.Label(
-            frame, text="Baud:", bg="#050509", fg="#CFD8DC",
-            font=("Segoe UI", 10),
-        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
-
-        self.cb_baud = ttk.Combobox(
-            frame, width=16, state="readonly",
-            values=["9600", "19200", "38400", "57600", "115200"],
-        )
+        tk.Label(frame, text="Baud:", bg="#050509", fg="#CFD8DC",
+                 font=("Segoe UI", 10)).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.cb_baud = ttk.Combobox(frame, width=16, state="readonly",
+                                    values=["9600", "19200", "38400", "57600", "115200"])
         self.cb_baud.grid(row=2, column=1, padx=4, pady=(4, 2))
         self.cb_baud.set("115200")
 
-        self.btn_connect = tk.Button(
-            frame, text="Conectar",
-            command=self.conectar_serial,
-            bg="#1B5E20", fg="#FFFFFF",
-            activebackground="#2E7D32",
-            activeforeground="#FFFFFF",
-            relief=tk.FLAT,
-            font=("Segoe UI", 10),
-            padx=8, pady=2,
-        )
+        self.btn_connect = tk.Button(frame, text="Conectar", command=self.conectar_serial,
+                                     bg="#1B5E20", fg="#FFFFFF", activebackground="#2E7D32",
+                                     activeforeground="#FFFFFF", relief=tk.FLAT,
+                                     font=("Segoe UI", 10), padx=8, pady=2)
         self.btn_connect.grid(row=3, column=0, columnspan=2, pady=(6, 4), sticky="we")
 
-        self.btn_disconnect = tk.Button(
-            frame, text="Desconectar",
-            command=self.desconectar_serial,
-            bg="#B71C1C", fg="#FFFFFF",
-            activebackground="#C62828",
-            activeforeground="#FFFFFF",
-            relief=tk.FLAT,
-            font=("Segoe UI", 10),
-            padx=8, pady=2,
-            state=tk.DISABLED,
-        )
+        self.btn_disconnect = tk.Button(frame, text="Desconectar", command=self.desconectar_serial,
+                                        bg="#B71C1C", fg="#FFFFFF", activebackground="#C62828",
+                                        activeforeground="#FFFFFF", relief=tk.FLAT,
+                                        font=("Segoe UI", 10), padx=8, pady=2, state=tk.DISABLED)
         self.btn_disconnect.grid(row=3, column=2, pady=(6, 4), sticky="we")
 
         self._atualizar_portas()
@@ -1905,20 +613,16 @@ class App:
             self.btn_connect.config(state=tk.NORMAL)
             self.btn_disconnect.config(state=tk.DISABLED)
 
-    # --- serial ---
-
     def conectar_serial(self):
         port = self.cb_port.get()
         if not port:
             messagebox.showwarning("Serial", "Selecione uma porta.")
             return
-
         try:
             baud = int(self.cb_baud.get())
         except ValueError:
             messagebox.showwarning("Serial", "Baud inválido.")
             return
-
         with self.serial_lock:
             try:
                 if self.ser and self.ser.is_open:
@@ -1931,14 +635,10 @@ class App:
                 self.status_bar.set_estado("sleep")
                 self._sync_serial_buttons(False)
                 return
-
             self._log("info", "SYSTEM", f"Conectado em {port} @ {baud}")
             self.reader_running = True
-            self.reader_thread = threading.Thread(
-                target=self._serial_loop, daemon=True
-            )
+            self.reader_thread = threading.Thread(target=self._serial_loop, daemon=True)
             self.reader_thread.start()
-
         self._sync_serial_buttons(True)
         self.face.set_estado("idle")
         self.status_bar.set_estado("idle")
@@ -1953,7 +653,6 @@ class App:
                 except Exception:
                     pass
                 self.ser = None
-
         self._log("info", "SYSTEM", "Serial desconectada.")
         self._sync_serial_buttons(False)
         self.face.set_estado("sleep")
@@ -1969,18 +668,14 @@ class App:
                         self.status_bar.set_estado("sleep")
                     time.sleep(0.01)
                     continue
-
                 try:
                     line = raw.decode("utf-8", errors="ignore").strip()
                 except Exception:
                     continue
-
                 if not line:
                     continue
-
                 self.ultimo_atividade = time.time()
                 self.root.after(0, self._handle_line, line)
-
             except Exception as e:
                 self._log("error", "SYSTEM", f"Erro na serial: {e}")
                 with self.serial_lock:
@@ -1999,25 +694,19 @@ class App:
         self.face.set_estado("sleep")
         self.status_bar.set_estado("sleep")
 
-    # --- tratamento de linha ---
-
     def _estimate_speech_from_text(self, txt: str):
-        """Estima duração (s) e intensidade (multiplicador) a partir do texto."""
         words = len(txt.split())
-        duration = max(0.6, words / 2.5)  # ~2.5 words/sec
-        # intensidade aproximada: mais palavras -> maior amplitude
+        duration = max(0.6, words / 2.5)
         syll_est = words * 1.4
-        intensity = min(2.0, 0.6 + (syll_est / 12.0))
+        intensity = min(0.9, 0.35 + (syll_est / 40.0))
         return duration, intensity
 
     def _handle_line(self, line: str):
-        # Permitir comandos seriais diretos para controle de boca:
         m = re.match(r"^\s*MOUTH[:\s]+([0-9]*\.?[0-9]+)", line, flags=re.I)
         if m:
             try:
                 lvl = float(m.group(1))
                 self.face.set_mouth_level(lvl)
-                # limpar override após 300ms se não houver atualização contínua
                 self.root.after(300, self.face.clear_mouth_override)
             except Exception:
                 pass
@@ -2029,7 +718,7 @@ class App:
                 dur = float(m2.group(1))
                 self.face.set_estado("speaking")
                 self.status_bar.set_estado("speaking")
-                self.face.marcar_fala(dur)
+                self.face.marcar_fala(dur, intensidade=0.55)
             except Exception:
                 pass
             return
@@ -2041,11 +730,9 @@ class App:
 
         pref_user = ">>"
         pref_bot = "<<"
-
         is_user = pref_user in msg
         is_bot = pref_bot in msg
         txt = msg.replace(pref_user, "").replace(pref_bot, "").strip()
-
 
         agora = time.time()
 
@@ -2055,7 +742,6 @@ class App:
             self._set_ia("")
             self.em_resposta = False
             self.ultimo_bot = 0.0
-
             self.face.set_estado("listening")
             self.status_bar.set_estado("listening")
             self._log("info", tag or "APP", f"Usuário: {txt}")
@@ -2070,14 +756,11 @@ class App:
             self.ultimo_bot = agora
             self._set_ia(self.texto_ia)
 
-            # estimar duração e intensidade a partir do texto para uma fala mais realista
             duration, intensity = self._estimate_speech_from_text(self.texto_ia)
-
             self.face.set_estado("speaking")
             self.status_bar.set_estado("speaking")
-            self.face.marcar_fala(duration, intensity)
-
-            self._log("info", tag or "APP", f"Alicia: {txt}")
+            self.face.marcar_fala(duration, intensidade=intensity)
+            self._log("info", tag or "APP", f"Jarvis: {txt}")
             return
 
         if tipo == "state":
@@ -2090,7 +773,7 @@ class App:
             elif "speaking" in low:
                 self.face.set_estado("speaking")
                 self.status_bar.set_estado("speaking")
-                self.face.marcar_fala(1.5)
+                self.face.marcar_fala(1.5, intensidade=0.5)
             else:
                 self.face.set_estado("idle")
                 self.status_bar.set_estado("idle")
@@ -2098,8 +781,6 @@ class App:
             self._log(tipo, tag, msg)
         else:
             self._log("info", tag, msg)
-
-    # --- helpers GUI ---
 
     def _set_ia(self, txt: str):
         self.txt_ia.config(state=tk.NORMAL)
